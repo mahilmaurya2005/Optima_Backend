@@ -19,7 +19,9 @@ const Label = require("../models/Label");
 const Cap = require("../models/Cap");
 const PreformProduction = require("../models/PreformProduction");
 
-const PreformProductionLogs = require("../models/PreformProductionLogs")
+const PreformProductionLogs = require("../models/PreformProductionLogs");
+const Wastage = require("../models/Wastage");
+
 class StockController {
   async getAllProducts(req, res) {
     try {
