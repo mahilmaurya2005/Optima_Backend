@@ -12,10 +12,19 @@ const capSchema = new mongoose.Schema({
   },
   quantityAvailable: { 
     type: Number, 
-    default: 0,
-    min: 0 
+    default: 0
+    // min: 0 removed to allow backorders/flexibility
   },
   remarks: { type: String },
+  stockRemarks: [{
+    message: { type: String },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    quantityChange: { type: Number },
+    previousQuantity: { type: Number },
+    newQuantity: { type: Number },
+    changeType: { type: String },
+    updatedAt: { type: Date, default: Date.now }
+  }],
   isActive: { 
     type: Boolean, 
     default: true 

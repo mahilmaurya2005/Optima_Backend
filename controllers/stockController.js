@@ -157,18 +157,48 @@ class StockController {
         .populate("updateHistory.updatedBy", "name")
         .populate("productId", "name");
 
-      if (!stockHistory) {
-        return res.status(404).json({
-          success: false,
-          message: "No stock history found for this product",
+      if (stockHistory) {
+        return res.status(200).json({
+          success: true,
+          data: stockHistory,
         });
       }
 
-      res.status(200).json({
+      // If no Stock document exists yet, check Product model
+      const product = await Product.findById(productId).populate(
+        "stockRemarks.updatedBy",
+        "name"
+      );
+
+      if (!product) {
+        return res.status(404).json({
+          success: false,
+          message: "Product not found",
+        });
+      }
+
+      // Convert product stockRemarks if available, or return empty history
+      const formattedRemarks = (product.stockRemarks || []).map((remark) => ({
+        boxes: remark.boxes || 0,
+        updatedAt: remark.updatedAt || new Date(),
+        updatedBy: remark.updatedBy || null,
+        changeType: remark.changeType || "adjustment",
+        notes: remark.message || "",
+      }));
+
+      return res.status(200).json({
         success: true,
-        data: stockHistory,
+        data: {
+          productId: {
+            _id: product._id,
+            name: product.name,
+          },
+          quantity: product.boxes || 0,
+          updateHistory: formattedRemarks,
+        },
       });
     } catch (error) {
+      console.error("Error fetching stock history:", error);
       res.status(500).json({
         success: false,
         message: "Error fetching stock history",
@@ -183,18 +213,12 @@ class StockController {
         .populate("updateHistory.updatedBy", "name")
         .populate("productId", "name");
 
-      if (!stockHistory || stockHistory.length === 0) {
-        return res.status(404).json({
-          success: false,
-          message: "No stock history found",
-        });
-      }
-
       res.status(200).json({
         success: true,
-        data: stockHistory,
+        data: stockHistory || [],
       });
     } catch (error) {
+      console.error("Error fetching stock history:", error);
       res.status(500).json({
         success: false,
         message: "Error fetching stock history",
@@ -720,6 +744,282 @@ class StockController {
       return res.status(500).json({
         success: false,
         message: error.message,
+      });
+    }
+  }
+
+  async adjustPreformStock(req, res) {
+    try {
+      const { id } = req.params;
+      const { changeType, quantityKg, notes, description } = req.body;
+      const userId = req.user?.id || req.user?._id;
+
+      if (!id) {
+        return res.status(400).json({ success: false, message: "Preform type ID is required" });
+      }
+      if (!changeType) {
+        return res.status(400).json({ success: false, message: "changeType is required (addition, reduction, or set_value)" });
+      }
+
+      const preform = await PreformType.findById(id);
+      if (!preform) {
+        return res.status(404).json({ success: false, message: "Preform type not found" });
+      }
+
+      const normalizedName = preform.name.toLowerCase().trim();
+
+      // Calculate current available stock
+      const existingProductions = await PreformProduction.find({ outcomeType: normalizedName });
+      let currentStock = 0;
+      existingProductions.forEach(p => {
+        const available = p.quantityProduced - (p.usedInBottles || 0);
+        currentStock += Math.max(0, available);
+      });
+
+      const qty = Number(quantityKg);
+      if (isNaN(qty) || qty < 0) {
+        return res.status(400).json({ success: false, message: "Quantity must be a valid non-negative number" });
+      }
+
+      const session = await mongoose.startSession();
+      session.startTransaction();
+
+      try {
+        if (changeType === "addition") {
+          if (qty <= 0) {
+            throw new Error("Addition quantity must be greater than 0");
+          }
+          await PreformProduction.create([{
+            outcomeType: normalizedName,
+            quantityProduced: qty,
+            type: "preform",
+            remarks: `Stock Addition: +${qty} Kg. ${notes || ""}`.trim(),
+            recordedBy: userId,
+            productionDate: new Date()
+          }], { session });
+
+        } else if (changeType === "reduction") {
+          if (qty <= 0) {
+            throw new Error("Reduction quantity must be greater than 0");
+          }
+          // Deduct from available batches (FIFO)
+          let remainingToDeduct = qty;
+          const availableBatches = await PreformProduction.find({
+            outcomeType: normalizedName,
+            $expr: {
+              $gt: [
+                { $subtract: ["$quantityProduced", { $ifNull: ["$usedInBottles", 0] }] },
+                0
+              ]
+            }
+          }).sort({ productionDate: 1 }).session(session);
+
+          for (const batch of availableBatches) {
+            if (remainingToDeduct <= 0) break;
+            const available = batch.quantityProduced - (batch.usedInBottles || 0);
+            if (available > 0) {
+              const deduct = Math.min(available, remainingToDeduct);
+              await PreformProduction.findByIdAndUpdate(
+                batch._id,
+                { $inc: { usedInBottles: deduct } },
+                { session }
+              );
+              remainingToDeduct -= deduct;
+            }
+          }
+
+          if (remainingToDeduct > 0) {
+            await PreformProduction.create([{
+              outcomeType: normalizedName,
+              quantityProduced: -remainingToDeduct,
+              type: "preform",
+              remarks: `Stock Reduction: -${qty} Kg (${remainingToDeduct.toFixed(2)} Kg deficit). ${notes || ""}`.trim(),
+              recordedBy: userId,
+              productionDate: new Date()
+            }], { session });
+          }
+
+        } else if (changeType === "set_value" || changeType === "adjustment") {
+          const diff = qty - currentStock;
+          if (Math.abs(diff) < 0.0001) {
+            // Already matches
+          } else if (diff > 0) {
+            await PreformProduction.create([{
+              outcomeType: normalizedName,
+              quantityProduced: diff,
+              type: "preform",
+              remarks: `Stock Adjusted to ${qty} Kg (+${diff.toFixed(2)} Kg). ${notes || ""}`.trim(),
+              recordedBy: userId,
+              productionDate: new Date()
+            }], { session });
+          } else {
+            const toDeduct = Math.abs(diff);
+            let remainingToDeduct = toDeduct;
+            const availableBatches = await PreformProduction.find({
+              outcomeType: normalizedName,
+              $expr: {
+                $gt: [
+                  { $subtract: ["$quantityProduced", { $ifNull: ["$usedInBottles", 0] }] },
+                  0
+                ]
+              }
+            }).sort({ productionDate: 1 }).session(session);
+
+            for (const batch of availableBatches) {
+              if (remainingToDeduct <= 0) break;
+              const available = batch.quantityProduced - (batch.usedInBottles || 0);
+              if (available > 0) {
+                const deduct = Math.min(available, remainingToDeduct);
+                await PreformProduction.findByIdAndUpdate(
+                  batch._id,
+                  { $inc: { usedInBottles: deduct } },
+                  { session }
+                );
+                remainingToDeduct -= deduct;
+              }
+            }
+
+            if (remainingToDeduct > 0) {
+              await PreformProduction.create([{
+                outcomeType: normalizedName,
+                quantityProduced: -remainingToDeduct,
+                type: "preform",
+                remarks: `Stock Adjusted to ${qty} Kg (-${toDeduct.toFixed(2)} Kg, ${remainingToDeduct.toFixed(2)} Kg deficit). ${notes || ""}`.trim(),
+                recordedBy: userId,
+                productionDate: new Date()
+              }], { session });
+            }
+          }
+        }
+
+        if (description !== undefined) {
+          preform.description = description;
+          await preform.save({ session });
+        }
+
+        await session.commitTransaction();
+        session.endSession();
+
+        const updatedProductions = await PreformProduction.find({ outcomeType: normalizedName });
+        let newStock = 0;
+        updatedProductions.forEach(p => {
+          const available = p.quantityProduced - (p.usedInBottles || 0);
+          newStock += Math.max(0, available);
+        });
+
+        return res.status(200).json({
+          success: true,
+          message: "Preform stock adjusted successfully",
+          data: {
+            preformType: preform,
+            availableStockKg: newStock
+          }
+        });
+
+      } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+      }
+
+    } catch (error) {
+      console.error("Error adjusting preform stock:", error);
+      return res.status(500).json({
+        success: false,
+        message: error.message || "Failed to adjust preform stock"
+      });
+    }
+  }
+
+  async getPreformTypeHistory(req, res) {
+    try {
+      const { id } = req.params;
+      const preform = await PreformType.findById(id);
+      if (!preform) {
+        return res.status(404).json({ success: false, message: "Preform type not found" });
+      }
+
+      const normalizedName = preform.name.toLowerCase().trim();
+
+      const preformProds = await PreformProduction.find({ outcomeType: normalizedName })
+        .populate("recordedBy", "name")
+        .sort({ productionDate: -1, createdAt: -1 })
+        .lean();
+
+      const bottleProds = await BottleProduction.find({
+        $or: [
+          { preformType: preform._id },
+          { "details.preformBatchUsage.batchId": { $in: preformProds.map(p => p._id) } }
+        ]
+      })
+        .populate("recordedBy", "name")
+        .sort({ productionDate: -1, createdAt: -1 })
+        .lean();
+
+      const history = [];
+
+      preformProds.forEach(p => {
+        let changeType = "addition";
+        const remarksLower = (p.remarks || "").toLowerCase();
+        if (remarksLower.includes("reduction")) {
+          changeType = "reduction";
+        } else if (remarksLower.includes("adjusted") || remarksLower.includes("set to") || remarksLower.includes("adjustment")) {
+          changeType = "adjustment";
+        } else if (remarksLower.includes("initial")) {
+          changeType = "initial";
+        }
+
+        history.push({
+          _id: p._id,
+          source: "preform_production",
+          date: p.productionDate || p.createdAt,
+          changeType: changeType,
+          quantityKg: p.quantityProduced,
+          usedInBottles: p.usedInBottles || 0,
+          wastageKg: p.wastageKg || 0,
+          notes: p.remarks || (changeType === "initial" ? "Initial Stock Entry" : "Preform Production Batch"),
+          recordedBy: p.recordedBy?.name || "Stock Manager",
+          batchId: p._id.toString()
+        });
+      });
+
+      bottleProds.forEach(bp => {
+        const bottlesSummary = (bp.producedBottles || []).map(b => `${b.boxesProduced} boxes of ${b.bottleName}`).join(", ");
+        history.push({
+          _id: bp._id,
+          source: "bottle_production",
+          date: bp.productionDate || bp.createdAt,
+          changeType: "deduction",
+          quantityKg: -(bp.totalPreformUsedKg || 0),
+          notes: `Used in Bottle Production: ${bottlesSummary || 'Bottles produced'}`,
+          rejectionsKg: (bp.bottleRejectionKg || 0) + (bp.preformRejectionKg || 0),
+          recordedBy: bp.recordedBy?.name || "Stock Manager",
+          batchId: bp._id.toString()
+        });
+      });
+
+      history.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      let totalAvailableKg = 0;
+      preformProds.forEach(p => {
+        const available = p.quantityProduced - (p.usedInBottles || 0);
+        totalAvailableKg += Math.max(0, available);
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          preformType: preform,
+          availableStockKg: totalAvailableKg,
+          history
+        }
+      });
+
+    } catch (error) {
+      console.error("Error fetching preform type history:", error);
+      return res.status(500).json({
+        success: false,
+        message: error.message || "Failed to fetch preform type history"
       });
     }
   }
@@ -1506,6 +1806,55 @@ class StockController {
           
           if (factor > 0) {
              totalShrinkRollKg += (item.boxesProduced * factor);
+          }
+
+          // ── Update Finished Product Stock (boxes) and Stock History ──
+          let product = null;
+          if (item.bottleId && mongoose.Types.ObjectId.isValid(item.bottleId)) {
+            product = await Product.findById(item.bottleId).session(session);
+          }
+          if (!product && item.bottleName) {
+            product = await Product.findOne({ name: item.bottleName }).session(session);
+            if (!product && item.bottleName.includes(" - ")) {
+              const baseName = item.bottleName.split(" - ")[0].trim();
+              product = await Product.findOne({ name: baseName }).session(session);
+            }
+          }
+
+          if (product) {
+            const addedBoxes = Number(item.boxesProduced) || 0;
+            const newBoxes = (product.boxes || 0) + addedBoxes;
+            const remark = {
+              message: `Bottle Production: Produced ${addedBoxes} boxes (${totalBottles} bottles)`,
+              updatedBy: userId,
+              boxes: addedBoxes,
+              changeType: "addition",
+              updatedAt: productionDate ? new Date(productionDate) : new Date(),
+            };
+
+            product.boxes = newBoxes;
+            if (!product.stockRemarks) product.stockRemarks = [];
+            product.stockRemarks.unshift(remark);
+            await product.save({ session });
+
+            // Also update or create Stock document for the product
+            let stockDoc = await Stock.findOne({ productId: product._id }).session(session);
+            if (!stockDoc) {
+              stockDoc = new Stock({
+                productId: product._id,
+                quantity: newBoxes,
+                updatedBy: userId,
+                updateHistory: [],
+              });
+            }
+            stockDoc.updateQuantity(
+              newBoxes,
+              userId,
+              "addition",
+              `Bottle Production: +${addedBoxes} boxes (${item.bottleName})`,
+              addedBoxes
+            );
+            await stockDoc.save({ session });
           }
         }
 
@@ -2829,16 +3178,20 @@ class StockController {
         boxes,
         bottlesPerBox,
         bottleCategoryId,
+        bottleId,
+        bottleName,
         labelId,
         capId,
         preformUsedKg
       } = req.body;
 
+      const targetBottleId = bottleCategoryId || bottleId;
+
       if (
         !preformTypeId ||
         !boxes ||
         !bottlesPerBox ||
-        !bottleCategoryId ||
+        (!targetBottleId && !bottleName) ||
         !labelId ||
         !capId ||
         preformUsedKg === undefined
@@ -2897,14 +3250,16 @@ class StockController {
       });
 
       // ✅ Bottle category
-      const bottleProduct = await Product.findById(bottleCategoryId)
-        .select("name category");
-
-      if (!bottleProduct) {
-        return res.status(404).json({
-          success: false,
-          message: "Bottle category not found"
-        });
+      let bottleProduct = null;
+      if (targetBottleId && mongoose.Types.ObjectId.isValid(targetBottleId)) {
+        bottleProduct = await Product.findById(targetBottleId).select("name category");
+      }
+      if (!bottleProduct && bottleName) {
+        bottleProduct = await Product.findOne({ name: bottleName }).select("name category");
+        if (!bottleProduct && bottleName.includes(" - ")) {
+          const baseName = bottleName.split(" - ")[0].trim();
+          bottleProduct = await Product.findOne({ name: baseName }).select("name category");
+        }
       }
 
       // ✅ Cap
@@ -2990,9 +3345,8 @@ class StockController {
             }
           },
           canProduce:
-            preformsAvailable >= totalBottles &&
+            preformsAvailable >= reqPreformUsedKg &&
             capsAvailable >= totalBottles &&
-            (shrinkRoll ? shrinkRoll.currentStock >= totalShrinkRoll : false) &&
             labelsAvailable >= totalBottles
         }
       });
@@ -3401,7 +3755,7 @@ class StockController {
   async addCap(req, res) {
     try {
       const { neckType, color, quantityAvailable, remarks } = req.body;
-      const userId = req.user.id;
+      const userId = req.user?.id || req.user?._id;
 
       if (!neckType || !color) {
         return res.status(400).json({
@@ -3424,12 +3778,22 @@ class StockController {
         });
       }
 
+      const initialQty = Number(quantityAvailable) || 0;
       const cap = new Cap({
         neckType,
         color,
-        quantityAvailable: quantityAvailable || 0,
+        quantityAvailable: initialQty,
         remarks,
-        createdBy: userId
+        createdBy: userId,
+        stockRemarks: initialQty > 0 ? [{
+          message: remarks || "Initial stock entry",
+          updatedBy: userId,
+          quantityChange: initialQty,
+          previousQuantity: 0,
+          newQuantity: initialQty,
+          changeType: "initial",
+          updatedAt: new Date()
+        }] : []
       });
 
       await cap.save();
@@ -3451,7 +3815,7 @@ class StockController {
     try {
       const { id } = req.params;
       const { quantityChange, changeType, remarks } = req.body;
-      const userId = req.user.id;
+      const userId = req.user?.id || req.user?._id;
 
       const cap = await Cap.findById(id);
       if (!cap) {
@@ -3461,20 +3825,16 @@ class StockController {
         });
       }
 
-      let newQuantity = cap.quantityAvailable;
+      const prevQty = Number(cap.quantityAvailable) || 0;
+      const changeNum = Number(quantityChange) || 0;
+      let newQuantity = prevQty;
 
       if (changeType === 'addition') {
-        newQuantity += quantityChange;
+        newQuantity += changeNum;
       } else if (changeType === 'reduction') {
-        newQuantity -= quantityChange;
-        if (newQuantity < 0) {
-          return res.status(400).json({
-            success: false,
-            message: "Insufficient cap stock"
-          });
-        }
+        newQuantity -= changeNum;
       } else if (changeType === 'set') {
-        newQuantity = quantityChange;
+        newQuantity = changeNum;
       }
 
       cap.quantityAvailable = newQuantity;
@@ -3483,6 +3843,17 @@ class StockController {
       if (remarks) {
         cap.remarks = remarks;
       }
+
+      if (!cap.stockRemarks) cap.stockRemarks = [];
+      cap.stockRemarks.push({
+        message: remarks || `Stock ${changeType}`,
+        updatedBy: userId,
+        quantityChange: changeType === 'set' ? (newQuantity - prevQty) : changeNum,
+        previousQuantity: prevQty,
+        newQuantity: newQuantity,
+        changeType: changeType,
+        updatedAt: new Date()
+      });
 
       await cap.save();
 
@@ -3496,6 +3867,110 @@ class StockController {
         success: false,
         message: error.message
       });
+    }
+  }
+
+  async getCapHistory(req, res) {
+    try {
+      const { id } = req.params;
+      const cap = await Cap.findById(id)
+        .populate("stockRemarks.updatedBy", "name")
+        .populate("createdBy", "name")
+        .populate("lastUpdatedBy", "name");
+
+      if (!cap) {
+        return res.status(404).json({ success: false, message: "Cap not found" });
+      }
+
+      const history = [];
+
+      // 1. Manual remarks and adjustments from cap.stockRemarks
+      if (cap.stockRemarks && cap.stockRemarks.length > 0) {
+        cap.stockRemarks.forEach(r => {
+          let qty = r.quantityChange;
+          if (r.changeType === 'reduction') qty = -Math.abs(qty);
+          history.push({
+            _id: r._id,
+            source: 'adjustment',
+            date: r.updatedAt,
+            changeType: r.changeType,
+            quantity: qty,
+            previousQuantity: r.previousQuantity,
+            newQuantity: r.newQuantity,
+            remarks: r.message,
+            recordedBy: r.updatedBy?.name || 'Stock Manager'
+          });
+        });
+      }
+
+      // 2. Bottle production usages where cap was used
+      const BottleProduction = require("../models/BottleProduction");
+      const bottleProductions = await BottleProduction.find({
+        "producedBottles.capId": id
+      })
+      .populate("recordedBy", "name")
+      .sort({ productionDate: -1 });
+
+      bottleProductions.forEach(prod => {
+        const matchingBottles = (prod.producedBottles || []).filter(b => b.capId && b.capId.toString() === id.toString());
+        const totalCapsUsed = matchingBottles.reduce((sum, b) => sum + ((b.boxesProduced || 0) * (b.bottlesPerBox || 0)), 0);
+        const bottlesSummary = matchingBottles.map(b => `${b.boxesProduced} boxes (${(b.boxesProduced || 0) * (b.bottlesPerBox || 0)} caps) of ${b.bottleName}`).join(", ");
+        
+        history.push({
+          _id: prod._id,
+          source: 'bottle_production',
+          date: prod.productionDate || prod.createdAt,
+          changeType: 'deduction',
+          quantity: -totalCapsUsed,
+          remarks: `Used in Bottle Production: ${bottlesSummary || 'Bottles produced'}`,
+          recordedBy: prod.recordedBy?.name || 'Stock Manager'
+        });
+      });
+
+      // 3. Cap production batches if any
+      const CapProduction = require("../models/CapProduction");
+      if (CapProduction) {
+        const capProductions = await CapProduction.find({
+          $or: [
+            { capType: cap.neckType, capColor: cap.color },
+            { capId: cap._id }
+          ]
+        })
+        .populate("recordedBy", "name")
+        .sort({ productionDate: -1 });
+
+        capProductions.forEach(cp => {
+          history.push({
+            _id: cp._id,
+            source: 'cap_production',
+            date: cp.productionDate || cp.createdAt,
+            changeType: 'production',
+            quantity: cp.quantityProduced,
+            remarks: cp.remarks || `Cap Production Batch (Wastage: ${cp.wastage || 0} Nos)`,
+            recordedBy: cp.recordedBy?.name || 'Stock Manager'
+          });
+        });
+      }
+
+      // Sort timeline descending
+      history.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          cap: {
+            _id: cap._id,
+            neckType: cap.neckType,
+            color: cap.color,
+            displayName: `${cap.neckType} - ${cap.color}`,
+            quantityAvailable: cap.quantityAvailable
+          },
+          history
+        }
+      });
+    } catch (error) {
+      console.error("Error fetching cap history:", error);
+      return res.status(500).json({ success: false, message: error.message });
     }
   }
 

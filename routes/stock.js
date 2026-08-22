@@ -39,6 +39,7 @@ router.delete("/label/:id", stockController.deleteLabel);
 router.post("/cap/add", stockController.addCap);
 router.put("/cap/:id/stock", stockController.updateCapStock);
 router.get("/caps", stockController.getCaps);
+router.get("/cap/:id/history", stockController.getCapHistory);
 router.delete("/cap/:id", stockController.deleteCap);
 
 // ============= PREFORM PRODUCTION =============
@@ -98,6 +99,8 @@ router.get("/production/batches", stockController.getProductionBatchesForSelecti
 router.post("/initialize-materials", stockController.initializeMaterials);
 
 router.post("/preform-type/add", stockController.addPreformType);
+router.post("/preform-type/:id/adjust-stock", stockController.adjustPreformStock);
+router.get("/preform-type/:id/history", stockController.getPreformTypeHistory);
 router.patch("/preform-type/:id", stockController.updatePreformType);
 router.delete("/preform-type/:id", stockController.deletePreformType);
 router.get("/preform-type", stockController.getPreformTypes);

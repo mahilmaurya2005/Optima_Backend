@@ -4,6 +4,7 @@ const bottleProductionSchema = new mongoose.Schema({
   preformType: { type: mongoose.Schema.Types.ObjectId, ref: "PreformType", required: true },
   
   producedBottles: [{
+    bottleId: { type: mongoose.Schema.Types.ObjectId, ref: "Product" },
     bottleName: { type: String, required: true },
     boxesProduced: { type: Number, required: true, min: 0 },
     bottlesPerBox: { type: Number, required: true, min: 0 },
